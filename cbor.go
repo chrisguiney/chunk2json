@@ -9,6 +9,8 @@ import (
 	"math"
 	"math/big"
 	"strconv"
+
+	gcbor "github.com/blinklabs-io/gouroboros/cbor"
 )
 
 // decodeCBOR walks raw CBOR into typed values rather than Go maps: Cardano
@@ -46,27 +48,25 @@ type entry struct{ K, V any }
 // lose its type.
 type cborMap []entry
 
-func (m cborMap) MarshalJSON() ([]byte, error) {
-	simple := true
+func (m cborMap) MarshalJSON() ([]byte, error) { return marshal(m) }
+
+func (m cborMap) asJSON() any {
 	for _, e := range m {
 		switch e.K.(type) {
 		case uint64, int64, string:
 		default:
-			simple = false
+			out := make([]any, len(m))
+			for i, e := range m {
+				out[i] = obj{{"k", e.K}, {"v", e.V}}
+			}
+			return out
 		}
 	}
-	if simple {
-		o := make(obj, len(m))
-		for i, e := range m {
-			o[i] = kv{fmt.Sprint(e.K), e.V}
-		}
-		return o.MarshalJSON()
-	}
-	out := make([]any, len(m))
+	o := make(obj, len(m))
 	for i, e := range m {
-		out[i] = obj{{"k", e.K}, {"v", e.V}}
+		o[i] = kv{fmt.Sprint(e.K), e.V}
 	}
-	return marshal(out)
+	return o
 }
 
 type tagV struct {
@@ -74,13 +74,11 @@ type tagV struct {
 	V   any
 }
 
-func (t tagV) MarshalJSON() ([]byte, error) {
-	return obj{{"@tag", t.Num}, {"@value", t.V}}.MarshalJSON()
-}
+func (t tagV) MarshalJSON() ([]byte, error) { return marshal(t) }
 
 type simpleV uint64
 
-func (s simpleV) MarshalJSON() ([]byte, error) { return obj{{"@simple", uint64(s)}}.MarshalJSON() }
+func (s simpleV) MarshalJSON() ([]byte, error) { return marshal(s) }
 
 type kv struct {
 	k string
@@ -90,37 +88,83 @@ type kv struct {
 // obj is a JSON object that keeps its field order.
 type obj []kv
 
-func (o obj) MarshalJSON() ([]byte, error) {
+func (o obj) MarshalJSON() ([]byte, error) { return marshal(o) }
+
+// marshal encodes v, writing this file's container types (obj, []any,
+// cborMap, tags) itself and handing only leaves and view structs to
+// encoding/json. encoding/json counts each nested MarshalJSON call toward its
+// depth limit, which deeply nested on-chain metadata exceeds; walking the
+// containers here keeps them out of that count.
+func marshal(v any) ([]byte, error) {
 	var buf bytes.Buffer
-	buf.WriteByte('{')
-	for i, e := range o {
-		if i > 0 {
-			buf.WriteByte(',')
-		}
-		k, _ := json.Marshal(e.k)
-		buf.Write(k)
-		buf.WriteByte(':')
-		v, err := marshal(e.v)
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(v)
+	if err := writeJSON(&buf, v, 0); err != nil {
+		return nil, err
 	}
-	buf.WriteByte('}')
 	return buf.Bytes(), nil
 }
 
-func marshal(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, err
+func writeJSON(buf *bytes.Buffer, v any, depth int) error {
+	if depth > maxDepth {
+		return errors.New("json: nesting too deep")
 	}
-	return bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}), nil
+	switch x := v.(type) {
+	case obj:
+		buf.WriteByte('{')
+		for i, e := range x {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			if err := writeLeaf(buf, e.k); err != nil {
+				return err
+			}
+			buf.WriteByte(':')
+			if err := writeJSON(buf, e.v, depth+1); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte('}')
+		return nil
+	case []any:
+		buf.WriteByte('[')
+		for i, e := range x {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			if err := writeJSON(buf, e, depth+1); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte(']')
+		return nil
+	case cborMap:
+		return writeJSON(buf, x.asJSON(), depth)
+	case tagV:
+		return writeJSON(buf, obj{{"@tag", x.Num}, {"@value", x.V}}, depth)
+	case simpleV:
+		return writeJSON(buf, obj{{"@simple", uint64(x)}}, depth)
+	case bytesV:
+		return writeLeaf(buf, hex.EncodeToString(x))
+	case bigNum:
+		return writeLeaf(buf, x.String())
+	default:
+		return writeLeaf(buf, v)
+	}
 }
 
-const maxDepth = 512
+func writeLeaf(buf *bytes.Buffer, v any) error {
+	enc := json.NewEncoder(buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return err
+	}
+	buf.Truncate(buf.Len() - 1) // Encode appends '\n'
+	return nil
+}
+
+// maxDepth bounds recursion on hostile input. It is gouroboros's decoder
+// limit, so the wire views accept exactly the blocks the struct view can
+// decode; real chain data comes close (one Preview block nests 16,056 levels).
+var maxDepth = gcbor.MaxNestedLevels
 
 var errBreak = errors.New("break")
 
@@ -202,9 +246,24 @@ func (d *walker) str(mt, ai byte, arg uint64) ([]byte, error) {
 	}
 }
 
+// jsonDepthCut is the CBOR nesting depth below which a subtree is printed as
+// {"@too_deep_cbor": "<hex>"} instead of being expanded. JSON parsers,
+// encoding/json and jq included, refuse documents nested more than 10,000
+// levels, and each CBOR level can cost two JSON levels. On-chain metadata
+// does reach this: one Preview transaction nests over 16,000 levels.
+const jsonDepthCut = 4096
+
 func (d *walker) item(depth int) (any, error) {
 	if depth > maxDepth {
 		return nil, errors.New("nesting too deep")
+	}
+	if depth == jsonDepthCut {
+		start := d.p
+		v, err := d.item(depth + 1)
+		if err != nil {
+			return v, err // includes errBreak, which must reach the enclosing container
+		}
+		return obj{{"@too_deep_cbor", bytesV(d.b[start:d.p])}}, nil
 	}
 	mt, ai, arg, err := d.head()
 	if err != nil {

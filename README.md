@@ -70,6 +70,17 @@ Each line is one block, in chunk order:
 - **`-generic`** — the raw CBOR as plain JSON with no labels: maps become
   objects or `[{"k","v"}]` lists, tags become `{"@tag","@value"}`.
 
+In every format, a subtree nested more than 4,096 CBOR levels deep is printed
+as `{"@too_deep_cbor": "<hex>"}` rather than expanded, so each line stays
+within the 10,000-level limit of common JSON parsers (encoding/json, jq).
+Transaction metadata on Preview reaches 16,056 levels. Inputs deeper than
+gouroboros's decoder limit (`cbor.MaxNestedLevels`, 16,384) are reported in
+`decode_error`.
+
+Pool relay IPv6 addresses are printed in standard notation. The ledger
+serialises them as four little-endian 32-bit words, which chunk2json
+reorders.
+
 Other flags: `-no-body` omits `block`, `-cbor` adds the block CBOR as hex,
 `-no-ledger` skips the gouroboros decode (and so `era`, `block_number`,
 `tx_count` and transaction ids) when the struct view is not being printed.

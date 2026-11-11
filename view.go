@@ -157,11 +157,11 @@ type PoolParamsView struct {
 }
 
 type RelayView struct {
-	Type     string `json:"type"` // single_host_addr, single_host_name, multi_host_name
-	Port     uint32 `json:"port,omitempty"`
-	IPv4     string `json:"ipv4,omitempty"`
-	IPv6     string `json:"ipv6,omitempty"`
-	Hostname string `json:"hostname,omitempty"`
+	Type     string  `json:"type"`           // single_host_addr, single_host_name, multi_host_name
+	Port     *uint32 `json:"port,omitempty"` // pointer: port 0 is distinct from no port
+	IPv4     string  `json:"ipv4,omitempty"`
+	IPv6     string  `json:"ipv6,omitempty"`
+	Hostname string  `json:"hostname,omitempty"`
 }
 
 type MIRView struct {

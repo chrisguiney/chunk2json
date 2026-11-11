@@ -215,8 +215,15 @@ func dumpChunk(arg string, enc *json.Encoder, body, withCbor, decodeLedger, wire
 				rec.Block = labelBlock(blk.Type, v, txHashes)
 			}
 		}
+		// Encode marshals fully before writing, so a failure leaves no partial
+		// line. The one expected failure is encoding/json's nesting limit on
+		// deeply nested metadata; drop that block's body rather than the chunk.
 		if err := enc.Encode(rec); err != nil {
-			return err
+			rec.Block = nil
+			rec.DecodeError = strings.TrimPrefix(rec.DecodeError+"; json: "+err.Error(), "; ")
+			if err := enc.Encode(rec); err != nil {
+				return err
+			}
 		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"net"
 	"reflect"
 	"sort"
 	"strings"
@@ -180,7 +181,7 @@ func output(o lcommon.TransactionOutput) OutputView {
 	// only when the output carries a hash and no datum.
 	if d := o.Datum(); d != nil && d.Data != nil {
 		ov.InlineDatum = plutusData(d.Data)
-	} else if h := o.DatumHash(); h != nil && *h != (lcommon.Blake2b256{}) {
+	} else if h := o.DatumHash(); h != nil { // an all-zero hash is real on-chain data
 		ov.DatumHash = h.String()
 	}
 	if s := o.ScriptRef(); s != nil {
@@ -261,24 +262,32 @@ func scriptBytes[T ~[]byte](ss []T) []string {
 
 // plutusData shows constructors as {"constructor","fields"} and maps as
 // [{"k","v"}], since Plutus map keys can be any datum.
-func plutusData(d data.PlutusData) any {
+func plutusData(d data.PlutusData) any { return plutusDataAt(d, 0) }
+
+func plutusDataAt(d data.PlutusData, depth int) any {
+	if depth >= jsonDepthCut {
+		if b, err := data.Encode(d); err == nil {
+			return obj{{"@too_deep_cbor", bytesV(b)}}
+		}
+		return obj{{"@too_deep_cbor", nil}}
+	}
 	switch x := deref(d).(type) {
 	case data.Constr:
 		fields := make([]any, len(x.Fields))
 		for i, f := range x.Fields {
-			fields[i] = plutusData(f)
+			fields[i] = plutusDataAt(f, depth+1)
 		}
 		return obj{{"constructor", num(x.Tag)}, {"fields", fields}}
 	case data.Map:
 		out := make([]any, len(x.Pairs))
 		for i, p := range x.Pairs {
-			out[i] = obj{{"k", plutusData(p[0])}, {"v", plutusData(p[1])}}
+			out[i] = obj{{"k", plutusDataAt(p[0], depth+1)}, {"v", plutusDataAt(p[1], depth+1)}}
 		}
 		return out
 	case data.List:
 		out := make([]any, len(x.Items))
 		for i, e := range x.Items {
-			out[i] = plutusData(e)
+			out[i] = plutusDataAt(e, depth+1)
 		}
 		return out
 	case data.Integer:
@@ -294,7 +303,12 @@ func plutusData(d data.PlutusData) any {
 
 // metadatum follows cardano-cli's no-schema JSON: byte strings are "0x…",
 // maps with only text/int keys are objects, other maps are [{"k","v"}].
-func metadatum(m lcommon.TransactionMetadatum) any {
+func metadatum(m lcommon.TransactionMetadatum) any { return metadatumAt(m, 0) }
+
+func metadatumAt(m lcommon.TransactionMetadatum, depth int) any {
+	if depth >= jsonDepthCut && m != nil {
+		return obj{{"@too_deep_cbor", bytesV(m.Cbor())}}
+	}
 	switch x := deref(m).(type) {
 	case lcommon.MetaInt:
 		return num(x.Value)
@@ -305,7 +319,7 @@ func metadatum(m lcommon.TransactionMetadatum) any {
 	case lcommon.MetaList:
 		out := make([]any, len(x.Items))
 		for i, e := range x.Items {
-			out[i] = metadatum(e)
+			out[i] = metadatumAt(e, depth+1)
 		}
 		return out
 	case lcommon.MetaMap:
@@ -320,13 +334,13 @@ func metadatum(m lcommon.TransactionMetadatum) any {
 		if simple {
 			o := make(obj, len(x.Pairs))
 			for i, p := range x.Pairs {
-				o[i] = kv{fmt.Sprint(metadatum(p.Key)), metadatum(p.Value)}
+				o[i] = kv{fmt.Sprint(metadatumAt(p.Key, depth+1)), metadatumAt(p.Value, depth+1)}
 			}
 			return o
 		}
 		out := make([]any, len(x.Pairs))
 		for i, p := range x.Pairs {
-			out[i] = obj{{"k", metadatum(p.Key)}, {"v", metadatum(p.Value)}}
+			out[i] = obj{{"k", metadatumAt(p.Key, depth+1)}, {"v", metadatumAt(p.Value, depth+1)}}
 		}
 		return out
 	case nil:
@@ -417,18 +431,35 @@ func certificate(c lcommon.Certificate) CertView {
 func relay(r lcommon.PoolRelay) RelayView {
 	rv := RelayView{Type: map[int]string{0: "single_host_addr", 1: "single_host_name", 2: "multi_host_name"}[r.Type]}
 	if r.Port != nil {
-		rv.Port = *r.Port
+		p := *r.Port
+		rv.Port = &p
 	}
 	if r.Ipv4 != nil {
 		rv.IPv4 = r.Ipv4.String()
 	}
 	if r.Ipv6 != nil {
-		rv.IPv6 = r.Ipv6.String()
+		rv.IPv6 = ipv6(*r.Ipv6)
 	}
 	if r.Hostname != nil {
 		rv.Hostname = *r.Hostname
 	}
 	return rv
+}
+
+// ipv6 formats a relay address. The ledger serialises IPv6 as four 32-bit
+// words, each little-endian, and gouroboros keeps those wire bytes as the
+// net.IP, so printing it directly reverses every 4-byte group
+// (2001:19f0:… comes out as 0120:19f0 → "f019:120:…").
+func ipv6(ip net.IP) string {
+	b := ip.To16()
+	if len(b) != net.IPv6len {
+		return ip.String()
+	}
+	out := make(net.IP, net.IPv6len)
+	for w := 0; w < net.IPv6len; w += 4 {
+		out[w], out[w+1], out[w+2], out[w+3] = b[w+3], b[w+2], b[w+1], b[w]
+	}
+	return out.String()
 }
 
 // ---- governance ----
