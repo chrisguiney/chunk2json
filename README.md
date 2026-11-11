@@ -116,8 +116,10 @@ CDDL labels are in [`labels.go`](labels.go).
 The struct view is checked against `-wire` by transforming each wire record
 into the struct view it should produce and comparing field by field; any wire
 field the transform does not recognise is reported. On a Preview snapshot
-(epoch 1477, immutable file 29556) every difference found was one of the
-normalisations listed above.
+(epoch 1477, immutable file 29556), across all 29,558 chunks, 4,844,465 blocks
+and 7,056,763 transactions, the two agree once the normalisations listed above
+are applied. One transaction's metadata nests past the depth cut and was not
+compared.
 
 ## License
 
